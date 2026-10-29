@@ -694,7 +694,7 @@ class BrowserApiTests(unittest.TestCase):
         app.link.robot = {'configurable_speeds':True, 'control_timeout_ms':3000, 'command_echo_ms':3000,
                           'hold_to_move':True, 'continuous_limit_s':None, 'steady_motion_renewal':True, 'startup_ack_ms':1500}
         tick = app.state()['browser_tick']
-        self.assertEqual(app.state()['app_version'], '0.3.3-20261018')
+        self.assertEqual(app.state()['app_version'], '0.3.4-20261029')
         body = {'action':'take','browser':'c'*32,'seq':1,'tick':tick,
                 'standing':True,'speed':.2,'lateral':.3,'turn':.45}
         app.control(body)

@@ -14,10 +14,11 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from transport import RobotLink
+from navigation_authority import NavigationAuthority
 from timeouts import BROWSER_FRESHNESS_S, OWNER_LEASE_S
 
 ROOT = pathlib.Path(__file__).resolve().parent / 'web'
-APP_VERSION = '0.3.3-20261018'
+APP_VERSION = '0.3.4-20261029'
 
 
 class App:
@@ -31,12 +32,19 @@ class App:
         self.sequences = {}
         self.ticks = collections.deque(maxlen=128)
         self.tick = 0
+        # Navigation gets a separate configured token and reuses this App's
+        # RobotLink. Missing token keeps the feature disabled; no secret is
+        # silently generated into an inaccessible process.
+        self.navigation = NavigationAuthority(self, config.get('navigation_token'))
 
     def state(self):
         with self.lock:
             self.tick += 1
             self.ticks.append((self.tick, time.monotonic()))
-            return dict(self.link.snapshot(), browser_tick=self.tick, app_version=APP_VERSION, app_name='go1_remote_control')
+            payload = dict(self.link.snapshot(), browser_tick=self.tick,
+                           app_version=APP_VERSION, app_name='go1_remote_control')
+            payload['navigation'] = self.navigation.snapshot()
+            return payload
 
     def control(self, body):
         with self.lock:
@@ -51,11 +59,13 @@ class App:
             if len(self.sequences) > 64:
                 self.sequences = {browser: seq, self.owner: self.sequences.get(self.owner, 0)}
             safe = action in ('stop', 'disarm', 'disconnect', 'release')
+            if self.navigation.task_id and not safe:
+                raise ValueError('导航任务正在占有控制权')
             if not safe and (type(tick) is not int or not any(n == tick and time.monotonic()-stamp <= BROWSER_FRESHNESS_S for n, stamp in self.ticks)):
                 self.link.submit('disarm')
                 raise ValueError('浏览器请求已过期；已请求停止并解除解锁')
             if self.owner and self.owner != browser and time.monotonic() < self.owner_until:
-                if action not in ('stop', 'disarm'):
+                if action not in ('stop', 'disarm', 'disconnect', 'release'):
                     raise ValueError('另一个页面正在控制；本页面仅可请求停止')
             else:
                 if self.owner and self.owner != browser:
@@ -65,8 +75,22 @@ class App:
                 self.owner_until = time.monotonic()+OWNER_LEASE_S
             elif action in ('disconnect', 'disarm'):
                 self.owner_until = 0
+            if safe and self.navigation.task_id:
+                self.navigation.revoke('manual_'+action)
             self.link.submit(action, key=body.get('key', ''), speed=body.get('speed', .5), standing=body.get('standing', False),
                              lateral=body.get('lateral', .4), turn=body.get('turn', .6))
+
+    def navigation_control(self, path, body, token):
+        if path == '/api/navigation/authorize':
+            return self.navigation.authorize(body.get('task_id'), token)
+        if path == '/api/navigation/command':
+            return self.navigation.command(body.get('task_id'), token, body.get('command_id'),
+                                           body.get('primitive'), body.get('ttl_s'))
+        if path == '/api/navigation/stop':
+            return self.navigation.stop(body.get('task_id', ''), token, body.get('reason', 'navigation_stop'))
+        if path == '/api/navigation/release':
+            return self.navigation.release(body.get('task_id', ''), token)
+        raise ValueError('navigation_path_invalid')
 
 
 def make_handler(app):
@@ -110,7 +134,9 @@ def make_handler(app):
                 self._send(404, {'error': 'Not found'})
 
         def do_POST(self):
-            if (urlsplit(self.path).path != '/api/control' or not self._trusted_host() or
+            path = urlsplit(self.path).path
+            if (path not in ('/api/control', '/api/navigation/authorize', '/api/navigation/command',
+                             '/api/navigation/stop', '/api/navigation/release') or not self._trusted_host() or
                     self.headers.get('Origin') not in ('http://127.0.0.1:'+str(app.port), 'http://localhost:'+str(app.port)) or
                     not secrets.compare_digest(self.headers.get('X-Go1-Local-Token', ''), app.token)):
                 self._send(403, {'error': 'Origin/token rejected'})
@@ -123,8 +149,13 @@ def make_handler(app):
                 body = json.loads(self.rfile.read(size), parse_constant=lambda _: (_ for _ in ()).throw(ValueError('Non-finite JSON')))
                 if not isinstance(body, dict):
                     raise ValueError('请求必须是对象')
-                app.control(body)
-                self._send(200, {'ok': True})
+                if path == '/api/control':
+                    app.control(body)
+                    result = {'ok': True}
+                else:
+                    nav_token = self.headers.get('X-Go1-Navigation-Token', '')
+                    result = app.navigation_control(path, body, nav_token)
+                self._send(200, result)
             except (ValueError, TypeError, OSError) as error:
                 self._send(400, {'error': str(error)})
     return Handler

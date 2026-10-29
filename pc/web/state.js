@@ -5,7 +5,7 @@
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.Go1Status = api;
 })(globalThis, function () {
-  const VERSION = '0.3.3-20261018';
+  const VERSION = '0.3.4-20261029';
   const NETWORK_TIMEOUT_MS = 3000;
   const finite = value => typeof value === 'number' && Number.isFinite(value);
   function describe(s) {
