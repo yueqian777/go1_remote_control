@@ -17,12 +17,31 @@ class FakeLink:
         self.calls = []
         self.connected = True
         self.robot = {'control_active': True, 'armed': True, 'health': 'OK'}
+        self.navigation_intent = None
 
     def snapshot(self):
-        return {'connected': self.connected, 'robot_fresh': True, 'robot': dict(self.robot)}
+        return {'connected': self.connected, 'robot_fresh': True, 'robot': dict(self.robot),
+                'navigation_intent_active': self.navigation_intent is not None,
+                'navigation_command_id': self.navigation_intent[0] if self.navigation_intent else None}
 
     def submit(self, action, key='', **kwargs):
         self.calls.append((action, key, kwargs))
+
+    def submit_navigation_intent(self, key, command_id, ttl_s):
+        self.navigation_intent = (command_id, key, ttl_s)
+        self.calls.append(('navigation_intent', key, {'command_id': command_id, 'ttl_s': ttl_s}))
+
+    def renew_navigation_intent(self, key, command_id, ttl_s):
+        if not self.navigation_intent or self.navigation_intent[0] != command_id:
+            raise ValueError('navigation_intent_invalid')
+        self.navigation_intent = (command_id, key, ttl_s)
+        self.calls.append(('navigation_renew', key, {'command_id': command_id, 'ttl_s': ttl_s}))
+
+    def clear_navigation_intent(self, reason='navigation_stop'):
+        had_intent = self.navigation_intent is not None
+        self.navigation_intent = None
+        self.calls.append(('stop', '', {'reason': reason}))
+        return had_intent
 
 
 class NavigationAuthorityTests(unittest.TestCase):
@@ -31,13 +50,60 @@ class NavigationAuthorityTests(unittest.TestCase):
                         'navigation_token': 'nav-secret', 'simulation': True}, 8099)
         self.app.link = FakeLink()
 
+    def tearDown(self):
+        self.app.navigation.close()
+
     def test_navigation_reuses_same_link_and_never_takes_or_arms(self):
         self.app.navigation.authorize('task-1', 'nav-secret')
         result = self.app.navigation.command('task-1', 'nav-secret', 'cmd-1', 'forward')
         self.assertTrue(result['accepted'])
-        self.assertEqual(self.app.link.calls, [('heartbeat', 'w', {})])
+        self.assertEqual(self.app.link.calls[0][0], 'navigation_intent')
+        self.assertEqual(self.app.link.calls[0][1], 'w')
         with self.assertRaisesRegex(ValueError, 'duplicate_command_id'):
             self.app.navigation.command('task-1', 'nav-secret', 'cmd-1', 'forward')
+
+    def test_task_switch_cannot_overwrite_active_navigation(self):
+        self.app.navigation.authorize('task-1', 'nav-secret')
+        with self.assertRaisesRegex(PermissionError, 'navigation_authority_conflict'):
+            self.app.navigation.authorize('task-2', 'nav-secret')
+        self.assertEqual(self.app.navigation.snapshot()['task_id'], 'task-1')
+
+    def test_command_id_is_unique_for_the_whole_task(self):
+        self.app.navigation.authorize('task-1', 'nav-secret')
+        self.app.navigation.command('task-1', 'nav-secret', 'cmd-a', 'forward')
+        self.app.navigation.command('task-1', 'nav-secret', 'cmd-b', 'forward')
+        with self.assertRaisesRegex(ValueError, 'duplicate_command_id'):
+            self.app.navigation.command('task-1', 'nav-secret', 'cmd-a', 'forward')
+
+    def test_navigation_requires_healthy_robot_feedback(self):
+        self.app.link.robot['health'] = 'STALE_STATE'
+        with self.assertRaisesRegex(PermissionError, 'navigation_control_session_not_ready'):
+            self.app.navigation.authorize('task-1', 'nav-secret')
+
+    def test_pause_stops_intent_but_preserves_task_lease(self):
+        self.app.navigation.authorize('task-1', 'nav-secret')
+        self.app.navigation.command('task-1', 'nav-secret', 'cmd-a', 'forward')
+        result = self.app.navigation.pause('task-1', 'nav-secret', 'visual_wait')
+        self.assertTrue(result['paused'])
+        state = self.app.navigation.snapshot()
+        self.assertTrue(state['active'])
+        self.assertTrue(state['paused'])
+        self.assertEqual(self.app.link.calls[-1][0], 'stop')
+
+    def test_keepalive_does_not_create_nonzero_intent(self):
+        self.app.navigation.authorize('task-1', 'nav-secret')
+        result = self.app.navigation.keepalive('task-1', 'nav-secret')
+        self.assertTrue(result['active'])
+        self.assertIsNone(self.app.link.navigation_intent)
+
+    def test_resume_requires_a_new_motion_command(self):
+        self.app.navigation.authorize('task-1', 'nav-secret')
+        self.app.navigation.command('task-1', 'nav-secret', 'cmd-a', 'forward')
+        self.app.navigation.pause('task-1', 'nav-secret')
+        self.app.navigation.resume('task-1', 'nav-secret')
+        self.assertFalse(self.app.link.navigation_intent is not None)
+        with self.assertRaisesRegex(ValueError, 'duplicate_command_id'):
+            self.app.navigation.command('task-1', 'nav-secret', 'cmd-a', 'forward')
 
     def test_manual_stop_revokes_navigation_lease(self):
         self.app.navigation.authorize('task-1', 'nav-secret')
@@ -80,7 +146,7 @@ class NavigationAuthorityTests(unittest.TestCase):
             with urllib.request.urlopen(urllib.request.Request(
                     base + '/api/navigation/command', body, headers)) as response:
                 self.assertTrue(json.load(response)['accepted'])
-            self.assertEqual([call[0] for call in self.app.link.calls], ['heartbeat'])
+            self.assertEqual([call[0] for call in self.app.link.calls], ['navigation_intent'])
         finally:
             server.shutdown()
             server.server_close()

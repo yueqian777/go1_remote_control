@@ -6,7 +6,9 @@ import select
 import socket
 import threading
 import time
-from timeouts import NETWORK_TIMEOUT_S, UI_LEASE_S, ACTION_QUEUE_S
+from timeouts import (
+    NETWORK_TIMEOUT_S, UI_LEASE_S, ACTION_QUEUE_S, NAVIGATION_SCHEDULER_PERIOD_S,
+)
 
 
 class RobotLink:
@@ -26,6 +28,9 @@ class RobotLink:
         self.queue = collections.deque(maxlen=8)
         self.force_stop = False
         self.stop_only = False
+        self.navigation_intent = None
+        self.last_navigation_command_id = None
+        self.navigation_intent_expirations = 0
         self.sequence = 0
         self.rtt_ms = None
         self.sent = {}
@@ -59,6 +64,8 @@ class RobotLink:
             self.ui_until = 0
             self.held_key = ''
             self.queue.clear()
+            self.navigation_intent = None
+            self.last_navigation_command_id = None
             self.force_stop = True
             self.robot = {}
             self.received_at = 0.
@@ -82,6 +89,7 @@ class RobotLink:
                 self.held_key = ''
                 self.ui_until = 0
                 self.last_ui_heartbeat = 0.
+                self.navigation_intent = None
                 self.force_stop = True
                 self.stopping.set()
                 self.disconnect_reason = '用户已断开；需要恢复后手动连接'
@@ -90,11 +98,13 @@ class RobotLink:
                 self.held_key = ''
                 self.ui_until = 0
                 self.last_ui_heartbeat = 0.
+                self.navigation_intent = None
                 self.force_stop = True
                 self.queue.clear()
                 return
             if action == 'stop':
                 self.held_key = ''
+                self.navigation_intent = None
                 self.stop_only = True
                 self.queue.clear()
                 return
@@ -146,6 +156,43 @@ class RobotLink:
                 self.held_key = ''
             self.queue.append((mapping[action], arg, time.monotonic()+ACTION_QUEUE_S))
 
+    def submit_navigation_intent(self, key, command_id, duration_s):
+        """Start one bounded automatic intent; the scheduler renews frames only
+        until this fixed deadline.  It never turns a navigation request into an
+        unbounded heartbeat stream.
+        """
+        if key not in ('w', 's', 'j', 'l', 'z', 'c'):
+            raise ValueError('无效导航方向')
+        if not isinstance(command_id, str) or not command_id:
+            raise ValueError('无效导航命令 ID')
+        duration_s = float(duration_s)
+        if not .05 <= duration_s <= 2.0:
+            raise ValueError('导航动作有效期必须在 0.05–2.0 秒内')
+        with self.lock:
+            now = time.monotonic()
+            if not self.connected or now-self.received_at > NETWORK_TIMEOUT_S:
+                raise ValueError('连接未就绪或状态已过期')
+            if self.held_key and now < self.ui_until:
+                raise ValueError('人工输入仍在控制；导航不能抢占')
+            self.navigation_intent = {
+                'key': key, 'command_id': command_id,
+                'expires_at': now + duration_s, 'duration_s': duration_s,
+            }
+            self.last_navigation_command_id = command_id
+            self.queue.clear()
+            self.stop_only = False
+
+    def clear_navigation_intent(self, reason='navigation_stop'):
+        with self.lock:
+            had_intent = self.navigation_intent is not None
+            self.navigation_intent = None
+            self.held_key = ''
+            self.stop_only = True
+            self.queue.clear()
+            if had_intent:
+                self.log('导航运动意图清除：'+str(reason))
+            return had_intent
+
     def snapshot(self):
         with self.lock:
             age = (time.monotonic()-self.received_at)*1000 if self.received_at else None
@@ -159,6 +206,12 @@ class RobotLink:
                     'degraded': self.connected and (age is None or age > NETWORK_TIMEOUT_S*1000),
                     'recovery_required': self.recovery_required, 'disconnect_reason': self.disconnect_reason,
                     'ui_lease_active': time.monotonic() < self.ui_until,
+                    'navigation_intent_active': self.navigation_intent is not None,
+                    'navigation_command_id': ((self.navigation_intent or {}).get('command_id')
+                                              or self.last_navigation_command_id),
+                    'navigation_intent_remaining_s': (max(0., self.navigation_intent['expires_at'] - time.monotonic())
+                                                      if self.navigation_intent else 0.),
+                    'navigation_intent_expirations': self.navigation_intent_expirations,
                     'input_diagnostics': {'heartbeat_age_ms': (time.monotonic()-self.last_ui_heartbeat)*1000 if self.last_ui_heartbeat else None,
                                           'max_heartbeat_gap_ms': self.max_ui_gap_ms, 'ui_expirations': self.ui_expirations},
                     'robot': dict(self.robot) if fresh else {}, 'events': list(self.events),
@@ -190,10 +243,12 @@ class RobotLink:
         stale = self.connected and now-self.received_at > NETWORK_TIMEOUT_S
         if stale:
             had_authority = bool(self.robot.get('control_active') or self.robot.get('armed') or self.held_key or
-                                 any(op in ('TAKE', 'ARM') for op, _, _ in self.queue))
+                                  self.navigation_intent or any(op in ('TAKE', 'ARM') for op, _, _ in self.queue))
             self.held_key = ''
             self.ui_until = 0
             self.queue.clear()
+            self.navigation_intent = None
+            self.stop_only = True
             self.recovery_required = self.recovery_required or had_authority
             if not self.degraded:
                 self.force_stop = True
@@ -213,6 +268,8 @@ class RobotLink:
         self.ui_until = 0
         self.last_ui_heartbeat = 0.
         self.queue.clear()
+        self.navigation_intent = None
+        self.last_navigation_command_id = None
         self.sent.clear()
         self.force_stop = True
         self.stop_only = False
@@ -283,8 +340,15 @@ class RobotLink:
                         # Stop is independent of receive freshness; never resend a queued MOVE on exit.
                         connection.sendall(self._frame('DISARM', '-', False))
                         raise ConnectionError('机器狗状态链路连续 3 秒无反馈；连接已关闭，需手动重连')
-                    if self.connected and now-last_send >= .05:
+                    if self.connected and now-last_send >= NAVIGATION_SCHEDULER_PERIOD_S:
                         ui_active = now < self.ui_until
+                        navigation_intent = self.navigation_intent
+                        if navigation_intent and now >= navigation_intent['expires_at']:
+                            self.navigation_intent = None
+                            self.navigation_intent_expirations += 1
+                            self.stop_only = True
+                            navigation_intent = None
+                            self.log('导航动作有效期结束：停止续发')
                         if self.force_stop or (not ui_active and self.held_key):
                             if not ui_active and self.held_key:
                                 self.ui_expirations += 1
@@ -302,6 +366,11 @@ class RobotLink:
                             op, arg, deadline = self.queue.popleft()
                             if now > deadline or not ui_active:
                                 op, arg = 'DISARM', '-'
+                        elif navigation_intent:
+                            # Automatic navigation has its own intent deadline,
+                            # while the receiver still enforces its 600 ms TTL.
+                            op, arg = 'MOVE', navigation_intent['key']
+                            ui_active = True
                         elif ui_active and self.held_key:
                             op, arg = 'MOVE', self.held_key
                         else:

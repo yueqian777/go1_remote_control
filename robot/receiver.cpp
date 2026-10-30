@@ -215,6 +215,8 @@ public:
     }
     std::string json(double t) const {
         const auto& s=backend_->state; std::ostringstream out;
+        const bool measured_stopped=s.valid && !policy_.moving() &&
+            std::hypot(s.vx,s.vy)<.05 && std::abs(s.yaw)<.05;
         out<<"\"control_active\":"<<(active ? "true" : "false")<<",\"armed\":"<<(policy_.armed ? "true" : "false")
             <<",\"stopping\":"<<(stopping_ ? "true" : "false")<<",\"stop_send_failed\":"<<(stop_failed_ ? "true" : "false")
             <<",\"fault\":"<<(policy_.fault ? "true" : "false")<<",\"fault_reason\":"<<quoted(policy_.fault_reason)
@@ -223,12 +225,17 @@ public:
             <<",\"state_age_ms\":"<<(s.valid ? number(std::max(0.,(t-s.stamp)*1000)) : "null")
             <<",\"soc\":"<<(s.valid ? std::to_string(s.soc) : "null")<<",\"bms\":"<<(s.valid ? std::to_string(s.bms) : "null")
             <<",\"actual_vx\":"<<(s.valid ? number(s.vx) : "null")<<",\"actual_vy\":"<<(s.valid ? number(s.vy) : "null")
-            <<",\"actual_yaw\":"<<(s.valid ? number(s.yaw) : "null")<<",\"height\":"<<(s.valid ? number(s.height) : "null")
+            <<",\"actual_yaw\":"<<(s.valid ? number(s.yaw) : "null")
+            <<",\"actual_yaw_rate\":"<<(s.valid ? number(s.yaw) : "null")
+            <<",\"actual_yaw_is_rate\":true,\"height\":"<<(s.valid ? number(s.height) : "null")
             <<",\"roll\":"<<(s.valid ? number(s.roll) : "null")<<",\"pitch\":"<<(s.valid ? number(s.pitch) : "null")
             <<",\"max_temperature\":"<<(s.valid ? number(s.temp) : "null")<<",\"feedback_mode\":"<<(s.valid ? std::to_string(s.mode) : "null")
             <<",\"feedback_gait\":"<<(s.valid ? std::to_string(s.gait) : "null")
             <<",\"command_vx\":"<<number(policy_.vx)<<",\"command_vy\":"<<number(policy_.vy)<<",\"command_yaw\":"<<number(policy_.yaw)
             <<",\"speed_vx\":"<<number(policy_.speed)<<",\"speed_vy\":"<<number(policy_.lateral_speed)<<",\"speed_yaw\":"<<number(policy_.turn_speed)
+            <<",\"remote_active\":"<<(s.valid && s.remote ? "true" : "false")
+            <<",\"motion_executing\":"<<(policy_.moving() ? "true" : "false")
+            <<",\"motion_stopped\":"<<(measured_stopped ? "true" : "false")
             <<",\"avoidance_selected\":"<<(policy_.avoidance ? "true" : "false")<<",\"motion_feedback\":"<<quoted(motion_.status())
             <<",\"gait_feedback\":"<<quoted(gait_.status())<<",\"ready_ms\":"<<number(good_since_<0 ? 0 : std::max(0.,(t-good_since_)*1000))
             <<",\"ttl_ms\":"<<number(policy_.moving() ? std::max(0.,policy_.expires-t)*1000 : 0)

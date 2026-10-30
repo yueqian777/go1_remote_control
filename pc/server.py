@@ -37,6 +37,10 @@ class App:
         # silently generated into an inaccessible process.
         self.navigation = NavigationAuthority(self, config.get('navigation_token'))
 
+    def close(self):
+        self.navigation.close()
+        self.link.close()
+
     def state(self):
         with self.lock:
             self.tick += 1
@@ -86,6 +90,12 @@ class App:
         if path == '/api/navigation/command':
             return self.navigation.command(body.get('task_id'), token, body.get('command_id'),
                                            body.get('primitive'), body.get('ttl_s'))
+        if path == '/api/navigation/keepalive':
+            return self.navigation.keepalive(body.get('task_id'), token)
+        if path == '/api/navigation/pause':
+            return self.navigation.pause(body.get('task_id'), token, body.get('reason', 'visual_wait'))
+        if path == '/api/navigation/resume':
+            return self.navigation.resume(body.get('task_id'), token)
         if path == '/api/navigation/stop':
             return self.navigation.stop(body.get('task_id', ''), token, body.get('reason', 'navigation_stop'))
         if path == '/api/navigation/release':
@@ -136,6 +146,7 @@ def make_handler(app):
         def do_POST(self):
             path = urlsplit(self.path).path
             if (path not in ('/api/control', '/api/navigation/authorize', '/api/navigation/command',
+                             '/api/navigation/keepalive', '/api/navigation/pause', '/api/navigation/resume',
                              '/api/navigation/stop', '/api/navigation/release') or not self._trusted_host() or
                     self.headers.get('Origin') not in ('http://127.0.0.1:'+str(app.port), 'http://localhost:'+str(app.port)) or
                     not secrets.compare_digest(self.headers.get('X-Go1-Local-Token', ''), app.token)):
@@ -156,7 +167,7 @@ def make_handler(app):
                     nav_token = self.headers.get('X-Go1-Navigation-Token', '')
                     result = app.navigation_control(path, body, nav_token)
                 self._send(200, result)
-            except (ValueError, TypeError, OSError) as error:
+            except (ValueError, TypeError, PermissionError, OSError) as error:
                 self._send(400, {'error': str(error)})
     return Handler
 
@@ -178,7 +189,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        app.link.close()
+        app.close()
         server.server_close()
 
 
