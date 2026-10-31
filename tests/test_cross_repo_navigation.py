@@ -4,7 +4,6 @@ import pathlib
 import sys
 import time
 import unittest
-from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 import threading
 
@@ -68,16 +67,31 @@ class CrossRepositoryNavigationTests(unittest.TestCase):
                 self.assertEqual(first["command_id"], "integration-cmd-1")
                 state = wait_until(lambda: client.snapshot()
                                     if client.snapshot()["navigation"]["motion_intent_active"] else None)
-                telemetry = adapter.telemetry_from_snapshot(state,
+                def causal_snapshot():
+                    candidate = client.snapshot()
+                    telemetry = adapter.telemetry_from_snapshot(
+                        candidate, expected_command_id="integration-cmd-1")
+                    return candidate if (candidate["robot"].get("motion_executing")
+                                         and telemetry.causal_feedback) else None
+                moving = wait_until(causal_snapshot)
+                for _ in range(3):
+                    self.assertTrue(adapter.keepalive()["active"])
+                    time.sleep(.08)
+                self.assertTrue(moving["robot"]["motion_executing"])
+                telemetry = adapter.telemetry_from_snapshot(moving,
                                                              expected_command_id="integration-cmd-1")
                 self.assertEqual(telemetry.command_id, "integration-cmd-1")
-                self.assertIn(telemetry.motion_feedback, {"executing", "stopped", "accepted"})
+                self.assertTrue(telemetry.causal_feedback)
+                self.assertEqual(telemetry.motion_feedback, "executing")
+                self.assertEqual(moving["navigation_feedback"]["command_id"], "integration-cmd-1")
+                self.assertEqual(moving["robot"]["motion_command_id"], "integration-cmd-1")
 
                 paused = adapter.pause("temporary_visual_gap")
                 self.assertTrue(paused["paused"])
                 paused_state = wait_until(lambda: client.snapshot()
                                           if client.snapshot()["navigation"]["paused"]
                                           and not client.snapshot()["navigation"]["motion_intent_active"]
+                                          and client.snapshot()["robot"].get("motion_stopped") is True
                                           else None)
                 paused_telemetry = adapter.telemetry_from_snapshot(paused_state)
                 self.assertTrue(paused_telemetry.navigation_paused)

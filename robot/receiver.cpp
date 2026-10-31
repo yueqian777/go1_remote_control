@@ -130,6 +130,9 @@ class Engine {
     bool was_moving_=false; double started_=0,good_since_=-1,stop_since_=-1;
     double last_move_rx_=-1,last_move_gap_=0,max_move_gap_=0;
     char last_move_key_=0;
+    unsigned long long last_command_seq_=0,last_motion_command_seq_=0;
+    std::string last_command_id_,last_motion_command_id_;
+    double last_command_at_=-1,last_motion_started_at_=-1,last_motion_stopped_at_=-1;
     unsigned long long move_rx_count_=0,logged_stops_=0;
     std::atomic<bool> stopping_{false},stop_failed_{false};
     std::thread stop_thread_;
@@ -155,7 +158,26 @@ public:
         stop_thread_=std::thread([this] { try { backend_->stop(); } catch (...) { stop_failed_=true; } stopping_=false; });
     }
     ~Engine() { if (active) release("SHUTDOWN"); if (stop_thread_.joinable()) stop_thread_.join(); }
-    void action(const std::string& op,const std::string& arg,bool ui_active,double t) {
+    void action(const std::string& op,const std::string& arg,bool ui_active,double t,
+                unsigned long long command_seq=0) {
+        last_command_seq_=command_seq; last_command_at_=t;
+        std::string command_id;
+        std::string motion_arg=arg;
+        if (op=="MOVE") {
+            const auto marker=arg.find('@');
+            if (marker!=std::string::npos) {
+                require(marker==1 && arg.size()<=130,"Invalid navigation command envelope");
+                command_id=arg.substr(marker+1);
+                require(!command_id.empty(),"Missing navigation command ID");
+                for (const char c:command_id) require((c>='A'&&c<='Z')||(c>='a'&&c<='z')||
+                    (c>='0'&&c<='9')||c=='.'||c=='_'||c==':'||c=='-',"Invalid navigation command ID");
+                motion_arg=arg.substr(0,marker);
+            }
+            last_command_id_=command_id;
+        }
+        if (op=="MOVE") {
+            last_motion_command_seq_=command_seq; last_motion_command_id_=command_id;
+        }
         if (op=="STOP" || op=="DISARM") {
             policy_.stop(op=="STOP" ? "USER_STOP" : "UI_DISARM"); report_stop();
             last_move_rx_=-1; last_move_key_=0;
@@ -177,11 +199,13 @@ public:
             const double turn=settings.size()==4 ? integer(settings[3])/1000. : .3;
             Policy checked(speed,lateral,turn); backend_->start(); policy_=checked; active=true; started_=t;
             last_move_rx_=-1; last_move_key_=0; last_move_gap_=max_move_gap_=0; move_rx_count_=logged_stops_=0;
+            last_command_seq_=last_motion_command_seq_=0; last_command_id_.clear(); last_motion_command_id_.clear();
+            last_command_at_=last_motion_started_at_=last_motion_stopped_at_=-1;
             good_since_=-1; stop_since_=-1; was_moving_=false; message="CONTROL_STARTED: wait healthy stationary 500ms, then A"; return;
         }
         if (!active) { message="TAKE_CONTROL_FIRST"; return; }
         char key=op=="ARM" ? 'a' : op=="RESET" ? 'r' : op=="AVOID" ? 'o' : 0;
-        if (op=="MOVE") { require(arg.size()==1 && std::string("wsjlzc").find(arg[0])!=std::string::npos,"Invalid motion key"); key=arg[0]; }
+        if (op=="MOVE") { require(motion_arg.size()==1 && std::string("wsjlzc").find(motion_arg[0])!=std::string::npos,"Invalid motion key"); key=motion_arg[0]; }
         require(key!=0,"Unknown operation");
         if (op=="MOVE") {
             if (last_move_rx_>=0 && last_move_key_==key) {
@@ -204,6 +228,8 @@ public:
         else good_since_=-1;
         if (t-started_>.5 || healthy) policy_.advance(t,healthy,s.health);
         if (!policy_.moving()) { if (was_moving_) stop_since_=t; } else stop_since_=-1;
+        if (policy_.moving() && !was_moving_) last_motion_started_at_=t;
+        if (!policy_.moving() && was_moving_) last_motion_stopped_at_=t;
         const auto motion_fault=motion_.update(t,policy_.vx,s.mode,policy_.vy,policy_.yaw);
         const auto gait_fault=gait_.update(t,policy_.moving(),policy_.avoidance,s.mode,s.gait);
         if (!motion_fault.empty() || !gait_fault.empty()) { policy_.trip(!motion_fault.empty() ? motion_fault : gait_fault); stop_since_=t; motion_.reset(); gait_.reset(); }
@@ -236,6 +262,16 @@ public:
             <<",\"remote_active\":"<<(s.valid && s.remote ? "true" : "false")
             <<",\"motion_executing\":"<<(policy_.moving() ? "true" : "false")
             <<",\"motion_stopped\":"<<(measured_stopped ? "true" : "false")
+            <<",\"navigation_feedback_version\":1"
+            <<",\"receiver_clock_id\":\"receiver_monotonic\""
+            <<",\"receiver_time_s\":"<<number(t)
+            <<",\"motion_command_seq\":"<<last_motion_command_seq_
+            <<",\"motion_command_id\":"<<quoted(last_motion_command_id_)
+            <<",\"last_command_seq\":"<<last_command_seq_
+            <<",\"last_command_id\":"<<quoted(last_command_id_)
+            <<",\"last_command_at_s\":"<<number(last_command_at_)
+            <<",\"motion_started_at_s\":"<<number(last_motion_started_at_)
+            <<",\"motion_stopped_at_s\":"<<number(last_motion_stopped_at_)
             <<",\"avoidance_selected\":"<<(policy_.avoidance ? "true" : "false")<<",\"motion_feedback\":"<<quoted(motion_.status())
             <<",\"gait_feedback\":"<<quoted(gait_.status())<<",\"ready_ms\":"<<number(good_since_<0 ? 0 : std::max(0.,(t-good_since_)*1000))
             <<",\"ttl_ms\":"<<number(policy_.moving() ? std::max(0.,policy_.expires-t)*1000 : 0)
@@ -339,9 +375,9 @@ int main(int argc,char** argv) {
                         const bool liveness=f[5]=="AUTH" || f[5]=="PING";
                         bool fresh=false; for (const auto& item:ticks) if (item.first==echo && t-item.second<=timing::echo_timeout_s) fresh=true;
                         seq=next_seq;
-                        if (!fresh && !safe && !liveness) { engine.action("DISARM","-",false,t); engine.message="STALE_COMMAND_REJECTED"; continue; }
+                        if (!fresh && !safe && !liveness) { engine.action("DISARM","-",false,t,next_seq); engine.message="STALE_COMMAND_REJECTED"; continue; }
                         if (!authenticated) { require(f[5]=="AUTH","Authenticate first"); authenticated=true; }
-                        else { require(f[5]!="AUTH","Duplicate AUTH"); engine.action(f[5],f[6],f[7]=="1",t); }
+                        else { require(f[5]!="AUTH","Duplicate AUTH"); engine.action(f[5],f[6],f[7]=="1",t,next_seq); }
                         last_rx=t;
                         // Old PING/AUTH can keep TCP alive, but can never renew motion freshness or UI authority.
                         if (fresh) last_fresh_rx=t;
@@ -356,7 +392,7 @@ int main(int argc,char** argv) {
             if (client!=bad_socket) {
                 if (pending.empty() && t>=next_status) {
                     ++tick; ticks.push_back({tick,t}); if (ticks.size()>timing::tick_history) ticks.pop_front();
-                    pending="{\"protocol\":1,\"receiver_version\":\"0.3.3-20261018\",\"startup_ack_ms\":1500,\"steady_motion_renewal\":true,\"command_ttl_ms\":600,\"hold_to_move\":true,\"configurable_speeds\":true,\"network_grace_ms\":3000,\"control_timeout_ms\":3000,\"command_echo_ms\":3000,\"ui_lease_ms\":750,\"session\":"+::quoted(session)+",\"tick\":"+std::to_string(tick)+
+                    pending="{\"protocol\":1,\"receiver_version\":\"0.4.0-20261030\",\"navigation_feedback_version\":1,\"capabilities\":[\"motion_stopped\",\"motion_executing\",\"actual_yaw_rate\",\"motion_command_seq\",\"receiver_clock_id\"],\"startup_ack_ms\":1500,\"steady_motion_renewal\":true,\"command_ttl_ms\":600,\"hold_to_move\":true,\"configurable_speeds\":true,\"network_grace_ms\":3000,\"control_timeout_ms\":3000,\"command_echo_ms\":3000,\"ui_lease_ms\":750,\"session\":"+::quoted(session)+",\"tick\":"+std::to_string(tick)+
                         ",\"authenticated\":"+(authenticated ? "true" : "false")+",\"simulated\":"+(simulate ? "true" : "false")+
                         ",\"ack_seq\":"+std::to_string(seq)+(authenticated ? ","+engine.json(t) : "")+"}\n";
                     next_status=t+.1; pending_since=t;

@@ -13,6 +13,7 @@ import time
 
 from timeouts import (
     NAVIGATION_INTENT_MAX_S,
+    NAVIGATION_FEEDBACK_VERSION,
     NAVIGATION_RESUME_WINDOW_S,
     NAVIGATION_SCHEDULER_PERIOD_S,
     NAVIGATION_TASK_LEASE_S,
@@ -80,24 +81,49 @@ class NavigationAuthority:
         if self.paused:
             raise PermissionError('navigation_task_paused')
 
-    def _ready(self):
+    def _ready_for_lease_renewal(self):
+        """Check authority health while a legal primitive may be moving."""
         state = self.app.link.snapshot()
         robot = state.get('robot') or {}
         if (state.get('connected') is not True or state.get('robot_fresh') is not True
+                or state.get('recovery_required') is True
                 or robot.get('control_active') is not True or robot.get('armed') is not True
                 or robot.get('health') not in (None, 'OK')
                 or robot.get('fault') is True or robot.get('remote_active') is True
                 or robot.get('stopping') is True):
             raise PermissionError('navigation_control_session_not_ready')
-        if robot.get('motion_stopped') is False:
-            raise PermissionError('navigation_motion_not_stopped')
+        self._require_feedback_capabilities(robot)
 
-    def _stop_intent_locked(self, reason):
+    def _require_feedback_capabilities(self, robot):
+        capabilities = robot.get('capabilities') or []
+        required = {'motion_stopped', 'motion_executing', 'actual_yaw_rate',
+                    'motion_command_seq', 'receiver_clock_id'}
+        if (robot.get('navigation_feedback_version') != NAVIGATION_FEEDBACK_VERSION
+                or not required.issubset(set(capabilities))):
+            raise PermissionError('navigation_feedback_capabilities_required')
+
+    def _ready_for_new_motion(self):
+        """Starting or switching an intent requires a verified stop."""
+        self._ready_for_lease_renewal()
+        state = self.app.link.snapshot()
+        robot = state.get('robot') or {}
+        self._require_feedback_capabilities(robot)
+        if robot.get('motion_stopped') is not True:
+            raise PermissionError('navigation_motion_not_stopped')
+        if state.get('navigation_intent_active'):
+            feedback = state.get('navigation_feedback') or {}
+            if not (feedback.get('motion_started_time_s') is not None
+                    and feedback.get('motion_stopped_time_s') is not None):
+                raise PermissionError('navigation_previous_motion_not_confirmed_stopped')
+
+    def _stop_intent_locked(self, reason, preserve_arm=False):
         clear = getattr(self.app.link, 'clear_navigation_intent', None)
         if clear is not None:
-            clear(reason)
+            clear(reason, preserve_arm=preserve_arm)
         try:
             self.app.link.submit('stop')
+            if preserve_arm and hasattr(self.app.link, 'navigation_hold'):
+                self.app.link.navigation_hold = True
         except (ValueError, OSError):
             pass
 
@@ -120,13 +146,16 @@ class NavigationAuthority:
             if self.task_id:
                 if task_id != self.task_id:
                     raise PermissionError('navigation_authority_conflict')
-                self._ready()
+                self._ready_for_lease_renewal()
                 self.lease_until = time.monotonic() + (self.resume_window_s if self.paused else self.lease_s)
                 self.app.owner_until = self.lease_until
                 return self.snapshot()
             if self.app.owner and self.app.owner != '__navigation__' and time.monotonic() < self.app.owner_until:
                 raise PermissionError('navigation_authority_conflict')
-            self._ready()
+            self._ready_for_lease_renewal()
+            self._require_feedback_capabilities(self.app.link.snapshot().get('robot') or {})
+            if (self.app.link.snapshot().get('robot') or {}).get('motion_stopped') is not True:
+                raise PermissionError('navigation_motion_not_stopped')
             self.task_id = task_id
             self.lease_until = time.monotonic() + self.lease_s
             self.paused = False
@@ -150,7 +179,7 @@ class NavigationAuthority:
                 raise ValueError('navigation_duplicate_command_id')
             if primitive not in SAFE_PRIMITIVES:
                 raise ValueError('navigation_primitive_invalid')
-            self._ready()
+            self._ready_for_new_motion()
             duration = self.primitive_ttl_s if ttl_s is None else float(ttl_s)
             if not .05 <= duration <= self.primitive_ttl_s:
                 raise ValueError('navigation_primitive_ttl_invalid')
@@ -173,10 +202,12 @@ class NavigationAuthority:
             self._require_token(token)
             if task_id != self.task_id:
                 raise PermissionError('navigation_lease_invalid')
+            if self.app.owner != '__navigation__':
+                raise PermissionError('navigation_authority_revoked')
+            self._ready_for_lease_renewal()
             if self.paused:
                 self.lease_until = time.monotonic() + self.resume_window_s
             else:
-                self._ready()
                 self.lease_until = time.monotonic() + self.lease_s
             self.app.owner_until = self.lease_until
             return self.snapshot()
@@ -186,7 +217,7 @@ class NavigationAuthority:
             self._expire_locked()
             self._require_token(token)
             self._require_active_task(task_id)
-            self._stop_intent_locked(reason)
+            self._stop_intent_locked(reason, preserve_arm=True)
             self.paused = True
             self.active_primitive = ''
             self.lease_until = time.monotonic() + self.resume_window_s
@@ -202,7 +233,7 @@ class NavigationAuthority:
                 raise PermissionError('navigation_lease_invalid')
             if not self.paused:
                 return self.snapshot()
-            self._ready()
+            self._ready_for_lease_renewal()
             self.paused = False
             self.active_primitive = ''
             self.lease_until = time.monotonic() + self.lease_s

@@ -12,6 +12,30 @@ from timeouts import (
 
 
 class RobotLink:
+    @staticmethod
+    def _blank_navigation_feedback():
+        return {
+            'command_id': None,
+            'command_created_time_s': None,
+            'intent_accepted_time_s': None,
+            'move_send_sequence': None,
+            'move_sent_time_s': None,
+            'receiver_ack_sequence': None,
+            'receiver_ack_time_s': None,
+            'receiver_command_sequence': None,
+            'receiver_clock_id': None,
+            'receiver_time_s': None,
+            'feedback_clock_id': None,
+            'time_uncertainty_s': None,
+            'clock_offset_s': None,
+            'motion_started_time_s': None,
+            'motion_stopped_time_s': None,
+            'receiver_motion_started_time_s': None,
+            'receiver_motion_stopped_time_s': None,
+            'status_received_time_s': None,
+            'causal_feedback': False,
+        }
+
     def __init__(self, config):
         self.config = config
         self.lock = threading.RLock()
@@ -29,11 +53,17 @@ class RobotLink:
         self.force_stop = False
         self.stop_only = False
         self.navigation_intent = None
+        self.navigation_hold = False
         self.last_navigation_command_id = None
         self.navigation_intent_expirations = 0
+        self.navigation_feedback = self._blank_navigation_feedback()
+        self.command_audit = collections.deque(maxlen=256)
+        self.receiver_clock_offset_s = None
+        self.receiver_clock_uncertainty_s = None
         self.sequence = 0
         self.rtt_ms = None
         self.sent = {}
+        self.sent_meta = {}
         self.recovery_required = False
         self.degraded = False
         self.disconnect_reason = ''
@@ -65,7 +95,12 @@ class RobotLink:
             self.held_key = ''
             self.queue.clear()
             self.navigation_intent = None
+            self.navigation_hold = False
             self.last_navigation_command_id = None
+            self.navigation_feedback = self._blank_navigation_feedback()
+            self.command_audit.clear()
+            self.receiver_clock_offset_s = None
+            self.receiver_clock_uncertainty_s = None
             self.force_stop = True
             self.robot = {}
             self.received_at = 0.
@@ -90,6 +125,7 @@ class RobotLink:
                 self.ui_until = 0
                 self.last_ui_heartbeat = 0.
                 self.navigation_intent = None
+                self.navigation_hold = False
                 self.force_stop = True
                 self.stopping.set()
                 self.disconnect_reason = '用户已断开；需要恢复后手动连接'
@@ -99,12 +135,14 @@ class RobotLink:
                 self.ui_until = 0
                 self.last_ui_heartbeat = 0.
                 self.navigation_intent = None
+                self.navigation_hold = False
                 self.force_stop = True
                 self.queue.clear()
                 return
             if action == 'stop':
                 self.held_key = ''
                 self.navigation_intent = None
+                self.navigation_hold = False
                 self.stop_only = True
                 self.queue.clear()
                 return
@@ -177,15 +215,28 @@ class RobotLink:
             self.navigation_intent = {
                 'key': key, 'command_id': command_id,
                 'expires_at': now + duration_s, 'duration_s': duration_s,
+                'created_at_s': now,
             }
             self.last_navigation_command_id = command_id
+            self.navigation_hold = True
+            self.navigation_feedback = self._blank_navigation_feedback()
+            self.navigation_feedback.update({
+                'command_id': command_id,
+                'command_created_time_s': now,
+                'intent_accepted_time_s': now,
+            })
+            self.command_audit.append({
+                'event': 'intent_accepted', 'command_id': command_id,
+                'time_s': now,
+            })
             self.queue.clear()
             self.stop_only = False
 
-    def clear_navigation_intent(self, reason='navigation_stop'):
+    def clear_navigation_intent(self, reason='navigation_stop', preserve_arm=False):
         with self.lock:
             had_intent = self.navigation_intent is not None
             self.navigation_intent = None
+            self.navigation_hold = bool(preserve_arm)
             self.held_key = ''
             self.stop_only = True
             self.queue.clear()
@@ -207,11 +258,15 @@ class RobotLink:
                     'recovery_required': self.recovery_required, 'disconnect_reason': self.disconnect_reason,
                     'ui_lease_active': time.monotonic() < self.ui_until,
                     'navigation_intent_active': self.navigation_intent is not None,
+                    'navigation_hold': self.navigation_hold,
                     'navigation_command_id': ((self.navigation_intent or {}).get('command_id')
                                               or self.last_navigation_command_id),
                     'navigation_intent_remaining_s': (max(0., self.navigation_intent['expires_at'] - time.monotonic())
                                                       if self.navigation_intent else 0.),
                     'navigation_intent_expirations': self.navigation_intent_expirations,
+                    'status_received_time_s': self.received_at or None,
+                    'navigation_feedback': dict(self.navigation_feedback),
+                    'command_audit': list(self.command_audit),
                     'input_diagnostics': {'heartbeat_age_ms': (time.monotonic()-self.last_ui_heartbeat)*1000 if self.last_ui_heartbeat else None,
                                           'max_heartbeat_gap_ms': self.max_ui_gap_ms, 'ui_expirations': self.ui_expirations},
                     'robot': dict(self.robot) if fresh else {}, 'events': list(self.events),
@@ -248,6 +303,7 @@ class RobotLink:
             self.ui_until = 0
             self.queue.clear()
             self.navigation_intent = None
+            self.navigation_hold = False
             self.stop_only = True
             self.recovery_required = self.recovery_required or had_authority
             if not self.degraded:
@@ -269,8 +325,13 @@ class RobotLink:
         self.last_ui_heartbeat = 0.
         self.queue.clear()
         self.navigation_intent = None
+        self.navigation_hold = False
         self.last_navigation_command_id = None
         self.sent.clear()
+        self.sent_meta.clear()
+        self.navigation_feedback = self._blank_navigation_feedback()
+        self.receiver_clock_offset_s = None
+        self.receiver_clock_uncertainty_s = None
         self.force_stop = True
         self.stop_only = False
         self.degraded = self.recovery_required = False
@@ -282,13 +343,103 @@ class RobotLink:
         if self.thread:
             self.thread.join(3)
 
-    def _frame(self, op, arg, ui_active):
+    def _frame(self, op, arg, ui_active, navigation_command_id=None):
+        now = time.monotonic()
         self.sequence += 1
-        self.sent[self.sequence] = time.monotonic()
-        self.sent = {k: v for k, v in self.sent.items() if time.monotonic()-v < NETWORK_TIMEOUT_S*2}
+        sequence = self.sequence
+        self.sent[sequence] = now
+        self.sent = {k: v for k, v in self.sent.items() if now-v < NETWORK_TIMEOUT_S*2}
+        self.sent_meta[sequence] = {
+            'op': op, 'command_id': navigation_command_id,
+            'created_time_s': now,
+        }
+        self.sent_meta = {k: v for k, v in self.sent_meta.items()
+                          if now-v['created_time_s'] < NETWORK_TIMEOUT_S*2}
+        self.command_audit.append({
+            'event': 'transport_frame_created', 'op': op,
+            'send_sequence': sequence, 'command_id': navigation_command_id,
+            'time_s': now,
+        })
+        if op == 'MOVE' and navigation_command_id:
+            feedback = self.navigation_feedback
+            if feedback.get('command_id') == navigation_command_id:
+                feedback['move_send_sequence'] = sequence
+                feedback['move_sent_time_s'] = now
+                self.command_audit.append({
+                    'event': 'move_sent', 'command_id': navigation_command_id,
+                    'send_sequence': sequence, 'time_s': now,
+                })
         return ('G1R1|{token}|{session}|{seq}|{tick}|{op}|{arg}|{ui}\n'.format(
             token=self.config['token'], session=self.robot['session'], seq=self.sequence,
             tick=self.robot['tick'], op=op, arg=arg, ui=int(ui_active))).encode('ascii')
+
+    def _observe_navigation_feedback(self, state, observed_at_s):
+        """Join receiver feedback to the exact MOVE sequence that was sent.
+
+        The HTTP snapshot time is only the PC observation time. It is never
+        used as a motion or stop event. Receiver ``motion_command_seq`` and
+        the echoed transport sequence establish the causal link first.
+        """
+        feedback = self.navigation_feedback
+        receiver_time_s = (state or {}).get('receiver_time_s')
+        if isinstance(receiver_time_s, (int, float)) and receiver_time_s >= 0:
+            sample_offset = observed_at_s - float(receiver_time_s)
+            if self.receiver_clock_offset_s is None:
+                self.receiver_clock_uncertainty_s = .15
+            else:
+                self.receiver_clock_uncertainty_s = max(
+                    .05, float(self.rtt_ms or 0) / 2000,
+                    abs(sample_offset - self.receiver_clock_offset_s) + .02)
+            self.receiver_clock_offset_s = sample_offset
+            feedback['clock_offset_s'] = self.receiver_clock_offset_s
+            feedback['time_uncertainty_s'] = self.receiver_clock_uncertainty_s
+        send_sequence = feedback.get('move_send_sequence')
+        if send_sequence is None:
+            return
+        ack_seq = state.get('ack_seq')
+        robot = state or {}
+        receiver_sequence = robot.get('motion_command_seq')
+        if ack_seq == send_sequence:
+            feedback['receiver_ack_sequence'] = ack_seq
+            feedback['receiver_ack_time_s'] = observed_at_s
+            self.command_audit.append({
+                'event': 'receiver_ack', 'command_id': feedback.get('command_id'),
+                'send_sequence': send_sequence, 'time_s': observed_at_s,
+            })
+        if receiver_sequence != send_sequence:
+            return
+        feedback['receiver_command_sequence'] = receiver_sequence
+        feedback['receiver_clock_id'] = 'receiver:' + str(state.get('session', ''))
+        feedback['receiver_time_s'] = robot.get('receiver_time_s')
+        feedback['causal_feedback'] = feedback.get('receiver_ack_sequence') == send_sequence
+        if (robot.get('motion_executing') is True
+                and feedback.get('motion_started_time_s') is None):
+            started = robot.get('motion_started_at_s')
+            feedback['receiver_motion_started_time_s'] = started
+            if (isinstance(started, (int, float)) and started >= 0
+                    and self.receiver_clock_offset_s is not None):
+                feedback['motion_started_time_s'] = float(started) + self.receiver_clock_offset_s
+                feedback['feedback_clock_id'] = 'pc_monotonic'
+                feedback['time_uncertainty_s'] = self.receiver_clock_uncertainty_s
+            self.command_audit.append({
+                'event': 'motion_started', 'command_id': feedback.get('command_id'),
+                'send_sequence': send_sequence, 'time_s': observed_at_s,
+            })
+        if (robot.get('motion_stopped') is True
+                and feedback.get('motion_started_time_s') is not None
+                and feedback.get('motion_stopped_time_s') is None):
+            stopped = robot.get('motion_stopped_at_s')
+            feedback['receiver_motion_stopped_time_s'] = stopped
+            if (isinstance(stopped, (int, float)) and stopped >= 0
+                    and self.receiver_clock_offset_s is not None):
+                feedback['motion_stopped_time_s'] = float(stopped) + self.receiver_clock_offset_s
+                feedback['feedback_clock_id'] = 'pc_monotonic'
+                feedback['time_uncertainty_s'] = self.receiver_clock_uncertainty_s
+            self.command_audit.append({
+                'event': 'motion_stopped', 'command_id': feedback.get('command_id'),
+                'send_sequence': send_sequence, 'time_s': observed_at_s,
+            })
+        feedback['status_received_time_s'] = observed_at_s
 
     def _run(self):
         connection = None
@@ -324,6 +475,7 @@ class RobotLink:
                             if self.robot and state['session'] != self.robot['session']:
                                 raise ConnectionError('接收端会话已改变')
                             self._accept_status(state)
+                            self._observe_navigation_feedback(state, time.monotonic())
                             if state.get('ack_seq') in self.sent:
                                 self.rtt_ms = (time.monotonic()-self.sent.pop(state['ack_seq']))*1000
                             if not authed_sent:
@@ -341,10 +493,11 @@ class RobotLink:
                         connection.sendall(self._frame('DISARM', '-', False))
                         raise ConnectionError('机器狗状态链路连续 3 秒无反馈；连接已关闭，需手动重连')
                     if self.connected and now-last_send >= NAVIGATION_SCHEDULER_PERIOD_S:
-                        ui_active = now < self.ui_until
+                        ui_active = now < self.ui_until or self.navigation_hold
                         navigation_intent = self.navigation_intent
                         if navigation_intent and now >= navigation_intent['expires_at']:
                             self.navigation_intent = None
+                            self.navigation_hold = False
                             self.navigation_intent_expirations += 1
                             self.stop_only = True
                             navigation_intent = None
@@ -369,13 +522,18 @@ class RobotLink:
                         elif navigation_intent:
                             # Automatic navigation has its own intent deadline,
                             # while the receiver still enforces its 600 ms TTL.
-                            op, arg = 'MOVE', navigation_intent['key']
+                            op, arg = 'MOVE', '{}@{}'.format(
+                                navigation_intent['key'], navigation_intent['command_id'])
                             ui_active = True
                         elif ui_active and self.held_key:
                             op, arg = 'MOVE', self.held_key
                         else:
                             op, arg = 'PING', '-'
-                        connection.sendall(self._frame(op, arg, ui_active))
+                        navigation_command_id = (navigation_intent or {}).get('command_id') \
+                            if op == 'MOVE' else None
+                        connection.sendall(self._frame(
+                            op, arg, ui_active,
+                            navigation_command_id=navigation_command_id))
                         last_send = now
             with self.lock:
                 if self.connected and self.robot:
